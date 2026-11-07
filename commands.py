@@ -10,11 +10,14 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from typing import Optional, Tuple
 
 from bot_config import CLAUDE_CLI, DEFAULT_CWD
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title
+from status_formatting import format_task_running_duration
+from workspace_helpers import resolve_workspace_by_value
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
 
@@ -94,14 +97,14 @@ BOT_COMMANDS = {
 async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, cli_all: list[dict] | None = None) -> list[dict]:
     """构建合并、去重、排序后的 session 列表（不含当前 session）。
     /resume 列表展示和 /resume N 选择都用这一个函数，保证索引一致。"""
-    cur_sid = (await store.get_current_raw(user_id, chat_id)).get("session_id")
+    cur_sid = (await store.get_current_raw(chat_id, chat_id)).get("session_id")
 
     if cli_all is None:
         cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
     feishu_sessions = [
-        {**s, "source": "feishu"} for s in await store.list_sessions(user_id, chat_id)
+        {**s, "source": "feishu"} for s in await store.list_sessions(chat_id, chat_id)
     ]
     for s in feishu_sessions:
         cli_info = cli_preview_map.get(s["session_id"])
@@ -143,7 +146,7 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
     """生成历史 sessions 列表，每个会话一个按钮。返回 dict(text, buttons) 或 str。"""
     from session_store import _clean_preview
 
-    cur = await store.get_current_raw(user_id, chat_id)
+    cur = await store.get_current_raw(chat_id, chat_id)
     cur_sid = cur.get("session_id")
 
     cli_all = scan_cli_sessions(30)
@@ -159,14 +162,14 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
     all_sids = [cur_sid] if cur_sid else []
     all_sids += [s["session_id"] for s in all_sessions]
     for sid in all_sids:
-        cached = store.get_summary(user_id, sid)
+        cached = store.get_summary(chat_id, sid)
         if cached:
             summaries[sid] = cached
         else:
             missing.append(sid)
     if missing:
         for sid in missing[:5]:
-            asyncio.create_task(store._bg_generate_summary(user_id, sid))
+            asyncio.create_task(store._bg_generate_summary(chat_id, sid))
 
     def _desc(sid: str, preview_raw: str) -> str:
         s = summaries.get(sid, "")
@@ -391,7 +394,7 @@ def _list_mcp() -> str:
 
 
 async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args: str) -> str:
-    cur = await store.get_current_raw(user_id, chat_id)
+    cur = await store.get_current_raw(chat_id, chat_id)
     base_dir = cur.get("cwd", DEFAULT_CWD)
     raw_target = args.strip()
 
@@ -442,7 +445,7 @@ async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args:
 
 
 async def _format_workspace_list(user_id: str, chat_id: str, store: SessionStore):
-    cur = await store.get_current_raw(user_id, chat_id)
+    cur = await store.get_current_raw(chat_id, chat_id)
     current_name = cur.get("workspace", "")
     current_cwd = cur.get("cwd", "~")
     workspaces = store.list_workspaces(user_id)
@@ -452,15 +455,15 @@ async def _format_workspace_list(user_id: str, chat_id: str, store: SessionStore
 
     buttons = []
     if workspaces:
-        for name, path in workspaces.items():
+        for i, (name, path) in enumerate(workspaces.items(), 1):
             marker = " ✓" if name == current_name else ""
             buttons.append({
-                "text": f"📁 {name}{marker}",
+                "text": f"📁 {i}. {name}{marker}",
                 "value": {"action": "run_cmd", "cmd": f"/ws use {name}", "cid": chat_id},
             })
 
     if buttons:
-        lines.append(f"已保存 {len(workspaces)} 个，点击切换：")
+        lines.append(f"已保存 {len(workspaces)} 个（`/ws use 序号` 也可切换），点击切换：")
         return {"text": "\n".join(lines), "buttons": buttons}
 
     lines.append("还没有已保存的工作空间。")
@@ -494,7 +497,7 @@ async def _handle_workspace_command(
         if len(parts) < 2:
             return "⚠️ 用法：`/ws save 名称 [路径]`"
         name = parts[1]
-        path = (await store.get_current_raw(user_id, chat_id)).get("cwd", DEFAULT_CWD)
+        path = (await store.get_current_raw(chat_id, chat_id)).get("cwd", DEFAULT_CWD)
         if len(parts) >= 3:
             path = os.path.expanduser(parts[2])
         if not os.path.isdir(path):
@@ -504,8 +507,16 @@ async def _handle_workspace_command(
 
     if action == "use":
         if len(parts) != 2:
-            return "⚠️ 用法：`/ws use 名称`"
+            return "⚠️ 用法：`/ws use 名称|序号|路径`"
         name = parts[1]
+        workspaces = store.list_workspaces(user_id)
+        if name not in workspaces:
+            # 照 ZCode workspaceHelpers：序号(列表顺序 1-based) → 精确 id → 唯一路径/标签匹配
+            refs = [{"id": n, "label": n, "workspacePath": p} for n, p in workspaces.items()]
+            resolved = resolve_workspace_by_value(refs, name, ["*"])
+            if not resolved:
+                return f"❌ 未找到工作空间：`{name}`，先用 `/ws save {name} 路径` 保存。"
+            name = resolved["id"]
         path = await store.bind_workspace(user_id, chat_id, name)
         if not path:
             return f"❌ 未找到工作空间：`{name}`，先用 `/ws save {name} 路径` 保存。"
@@ -521,8 +532,8 @@ async def _handle_workspace_command(
         path = os.path.expanduser(parts[1])
         if not os.path.isdir(path):
             return f"❌ 路径不存在：`{path}`"
-        old_name = (await store.get_current_raw(user_id, chat_id)).get("workspace", "")
-        await store.set_cwd(user_id, chat_id, path)
+        old_name = (await store.get_current_raw(chat_id, chat_id)).get("workspace", "")
+        await store.set_cwd(chat_id, chat_id, path)
         suffix = "，并解除原工作空间绑定" if old_name else ""
         return f"✅ 当前群组工作目录已切换为 `{path}`{suffix}"
 
@@ -566,11 +577,11 @@ async def handle_command(
             if alias in VALID_MODES:
                 new_mode = alias
 
-        old_title = await store.new_session(user_id, chat_id)
+        old_title = await store.new_session(chat_id, chat_id)
         if new_mode:
-            await store.set_permission_mode(user_id, chat_id, new_mode)
+            await store.set_permission_mode(chat_id, chat_id, new_mode)
 
-        cur = await store.get_current(user_id, chat_id)
+        cur = await store.get_current(chat_id, chat_id)
         parts = []
         if old_title:
             parts.append(f"✅ 已开始新 session。\n上个会话：「{old_title}」")
@@ -600,11 +611,11 @@ async def handle_command(
                 return f"❌ 序号 {int(args)} 超出范围（共 {len(all_sessions)} 条）。"
         except ValueError:
             pass  # 直接用 session ID 字符串
-        session_id, old_title = await store.resume_session(user_id, chat_id, args)
+        session_id, old_title = await store.resume_session(chat_id, chat_id, args)
         if not session_id:
             return f"❌ 未找到 session：`{args}`，用 `/resume` 查看列表。"
         # 用摘要作为会话名，没有就用 ID 前缀
-        name = store.get_summary(user_id, session_id) or f"#{session_id[:8]}"
+        name = store.get_summary(chat_id, session_id) or f"#{session_id[:8]}"
         reply = f"✅ 已恢复会话「{name}」，继续对话吧。"
         if old_title:
             reply += f"\n上个会话：「{old_title}」"
@@ -612,7 +623,7 @@ async def handle_command(
 
     elif cmd == "model":
         if not args:
-            cur = await store.get_current(user_id, chat_id)
+            cur = await store.get_current(chat_id, chat_id)
             return {
                 "text": f"当前模型：**{cur.model}**",
                 "buttons": [
@@ -622,17 +633,34 @@ async def handle_command(
                 ],
             }
         model = MODEL_ALIASES.get(args.lower(), args)
-        await store.set_model(user_id, chat_id, model)
+        await store.set_model(chat_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`"
 
     elif cmd == "status":
-        cur = await store.get_current_raw(user_id, chat_id)
+        cur = await store.get_current_raw(chat_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
         model = cur.get("model", "未知")
         cwd = cur.get("cwd", "~")
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
         mode = cur.get("permission_mode") or "bypassPermissions"
+        # 已工作时长：从 started_at 推导，解析失败就不显示这一行
+        worked_line = ""
+        try:
+            started_dt = datetime.fromisoformat(cur.get("started_at"))
+            worked_ms = max(int((time.time() - started_dt.timestamp()) * 1000), 0)
+            worked_line = f"\n已工作: {format_task_running_duration(worked_ms)}"
+        except Exception:
+            pass
+        # 任务运行状态：registry 单例在 main，延迟导入避免循环依赖
+        running_line = ""
+        try:
+            from main import _active_runs
+            active = _active_runs.get_run(chat_id)
+            if active and not active.stop_requested:
+                running_line = "\n任务状态: ⏳ 运行中（/stop 可停止）"
+        except Exception:
+            pass
         return (
             f"📊 **当前 Session 状态**\n"
             f"Session ID: `{sid}`\n"
@@ -640,12 +668,12 @@ async def handle_command(
             f"权限模式: `{mode}`\n"
             f"工作空间: `{workspace}`\n"
             f"工作目录: `{cwd}`\n"
-            f"开始时间: {started}"
+            f"开始时间: {started}{worked_line}{running_line}"
         )
 
     elif cmd == "mode":
         if not args:
-            cur = await store.get_current(user_id, chat_id)
+            cur = await store.get_current(chat_id, chat_id)
             return {
                 "text": f"当前模式：**{cur.permission_mode}**\n{VALID_MODES.get(cur.permission_mode, '')}",
                 "buttons": [
@@ -658,7 +686,7 @@ async def handle_command(
         mode = MODE_ALIASES.get(args.lower(), args)
         if mode not in VALID_MODES:
             return f"❌ 未知模式：`{args}`\n可选：{', '.join(f'`{m}`' for m in VALID_MODES)}"
-        await store.set_permission_mode(user_id, chat_id, mode)
+        await store.set_permission_mode(chat_id, chat_id, mode)
         return f"✅ 已切换为 **{mode}** — {VALID_MODES[mode]}"
 
     elif cmd == "cd":
@@ -667,8 +695,8 @@ async def handle_command(
         path = os.path.expanduser(args)
         if not os.path.isdir(path):
             return f"❌ 路径不存在：`{path}`"
-        old_name = (await store.get_current_raw(user_id, chat_id)).get("workspace", "")
-        await store.set_cwd(user_id, chat_id, path)
+        old_name = (await store.get_current_raw(chat_id, chat_id)).get("workspace", "")
+        await store.set_cwd(chat_id, chat_id, path)
         suffix = "，并解除原工作空间绑定" if old_name else ""
         return f"✅ 工作目录已切换为 `{path}`{suffix}"
 

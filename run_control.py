@@ -7,6 +7,7 @@ from typing import Awaitable, Callable, Optional
 class ActiveRun:
     user_id: str
     card_msg_id: str
+    trigger_msg_id: str = ""            # 用户发来 trigger 的消息 id；用于翻表情
     proc: object | None = None
     stop_requested: bool = False
     stop_announced: bool = False
@@ -16,8 +17,10 @@ class ActiveRunRegistry:
     def __init__(self):
         self._runs: dict[str, ActiveRun] = {}
 
-    def start_run(self, user_id: str, card_msg_id: str) -> ActiveRun:
-        active_run = ActiveRun(user_id=user_id, card_msg_id=card_msg_id)
+    def start_run(self, user_id: str, card_msg_id: str,
+                  trigger_msg_id: str = "") -> ActiveRun:
+        active_run = ActiveRun(user_id=user_id, card_msg_id=card_msg_id,
+                               trigger_msg_id=trigger_msg_id)
         self._runs[user_id] = active_run
         return active_run
 
