@@ -954,6 +954,279 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg,
     await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id)
 
 
+# ── 微信 iLink Bot 渠道（照 ZCode weixin 渠道全量语义）─────────
+# 无卡片、无表情回复、无 mention 机制的纯文本通道：流式展示降级为
+# typing 状态 + 最终文本分片；命令/授权/排队/会话语义与飞书路径一致。
+
+_weixin_client = None
+_weixin_runtime = None
+
+
+def _weixin_status_sink(status: str):
+    print(f"[weixin] {status}", flush=True)
+
+
+def _wx_keys(inbound: dict) -> tuple[str, str, str, bool]:
+    """(sender_user_id, owner_key, store_owner, is_group)。
+
+    owner_key：群聊=群 id，私聊=user_id。store/lock/run 维度统一加 "wx:" 前缀
+    隔离命名空间——workspace 库存归 user_id 的语义在微信渠道独立成键，
+    不与飞书侧（oc_/ou_ 键）混用同一会话与工作区绑定。
+    """
+    user_id = inbound["user_id"]
+    chat_id = inbound.get("chat_id") or ""
+    is_group = bool(chat_id)
+    owner = chat_id if is_group else user_id
+    return user_id, owner, "wx:" + owner, is_group
+
+
+async def _weixin_send_text(to_user_id: str, text: str, context_token: str = ""):
+    if not _weixin_client:
+        return
+    await asyncio.to_thread(
+        _weixin_client.send_text, to_user_id, text, config.WEIXIN_BOT_USER_ID, context_token,
+    )
+
+
+def _weixin_menu_text() -> str:
+    return "\n".join([
+        "⚡ 可用命令：",
+        "/new 新会话（可带 plan）",
+        "/resume 恢复会话",
+        "/stop 停止当前任务",
+        "/model 切模型",
+        "/mode 切模式",
+        "/ws 工作空间",
+        "/status /usage /ls 状态与目录",
+        "/help 完整帮助",
+    ])
+
+
+def _weixin_on_message(message: dict):
+    """轮询线程回调。同步等待处理完成——游标必须在本批消息全部进入
+    业务处理后才能写盘，异步丢过去不等会让中途失败的消息被服务端消费掉。"""
+    future = asyncio.run_coroutine_threadsafe(handle_weixin_message_async(message), _bot_loop)
+    try:
+        future.result(timeout=3600)
+    except Exception as e:
+        print(f"[weixin] 消息处理失败: {type(e).__name__}: {e}", flush=True)
+
+
+async def handle_weixin_message_async(inbound: dict):
+    """微信入站消息入口：幂等 → 附件处理 → 排队 → _weixin_process。"""
+    user_id, owner, store_owner, is_group = _wx_keys(inbound)
+    print(f"[weixin 收到消息] user={user_id[:8]}... group={is_group}", flush=True)
+
+    message_id = inbound.get("message_id") or ""
+    if message_id and _is_duplicate("wx:" + message_id):
+        print(f"[weixin dedup] 忽略重复消息 {message_id}", flush=True)
+        return
+
+    text = (inbound.get("text") or "").strip()
+    context_token = inbound.get("context_token") or ""
+
+    # /stop 与 / 在锁外处理（与飞书路径一致：自救命令不排队）
+    low = text.lower()
+    if low == "/stop" or low == "/停止" or low.endswith("/stop") or low.endswith("/停止"):
+        if not _admit(user_id, is_group, True):
+            return
+        await _weixin_send_text(user_id, await _handle_stop_command(store_owner), context_token)
+        return
+    if text == "/":
+        if not _admit(user_id, is_group, True):
+            return
+        await _weixin_send_text(user_id, _weixin_menu_text(), context_token)
+        return
+
+    # 授权门：微信无 @ 机制，群聊默认响应所有文本（回声已由 message_type==2 协议层过滤）
+    if not _admit(user_id, is_group, True):
+        return
+
+    # 附件：image/file 下载落盘喂 Claude；audio/video 明确拒收（与飞书 audio/media 一致）
+    att_notes: list[str] = []
+    for i, att in enumerate(inbound.get("attachments") or []):
+        kind = att.get("kind")
+        if kind in ("audio", "video"):
+            await _weixin_send_text(user_id, "❌ 暂不支持语音/视频消息，请改用文字或发文件。", context_token)
+            return
+        if att.get("size_bytes") and att["size_bytes"] > 5 * 1024 * 1024:
+            await _weixin_send_text(user_id, f"❌ 附件超过 5MB（{att.get('filename')}），请压缩后重新发送。", context_token)
+            return
+        if not att.get("download_url") or not att.get("aes_key"):
+            att_notes.append(f"[附件 {att.get('filename')} 缺少下载地址或解密密钥，无法读取]")
+            continue
+        try:
+            data = await asyncio.to_thread(
+                _weixin_client.download_attachment, att["download_url"], att["aes_key"],
+            )
+            import tempfile as _tempfile
+            safe_name = re.sub(r"[^\w.\-一-鿿]", "_", att.get("filename") or f"weixin-{i+1}")
+            path = os.path.join(_tempfile.gettempdir(), f"weixin-{kind}-{int(time.time()*1000)}-{i+1}-{safe_name}")
+            with open(path, "wb") as f:
+                f.write(data)
+            att_notes.append(f"[用户发送了文件：{path}（文件名：{att.get('filename')}）。请先读取该文件内容，再结合用户的指示处理，直接回复用中文]")
+            print(f"[weixin 附件] {kind} {path}", flush=True)
+        except Exception as e:
+            print(f"[weixin] 附件下载失败: {e}", flush=True)
+            att_notes.append(f"[附件 {att.get('filename')} 下载失败：{e}]")
+
+    final_text = text
+    if att_notes:
+        final_text = (final_text + "\n\n" if final_text else "") + "\n\n".join(att_notes)
+    if not final_text.strip():
+        return
+
+    # 默认不腰斩长任务：与飞书一致，排队等待当前 turn 结束后作为 follow-up 继续
+    if config.INTERRUPT_ON_NEW_MESSAGE:
+        active = _active_runs.get_run(store_owner)
+        if active and not active.stop_requested:
+            print("[weixin 打断] 新消息到达，自动停止当前任务", flush=True)
+            await stop_run(_active_runs, store_owner, on_stopped=None)
+
+    if store_owner not in _chat_locks:
+        if len(_chat_locks) >= _MAX_CHAT_LOCKS:
+            idle = [k for k, v in _chat_locks.items() if not v.locked()]
+            for k in idle:
+                del _chat_locks[k]
+        _chat_locks[store_owner] = asyncio.Lock()
+    lock = _chat_locks[store_owner]
+
+    if lock.locked():
+        await _weixin_send_text(user_id, "⏳ 当前有任务正在处理，已排队等待，完成后会依次处理。", context_token)
+
+    async with lock:
+        async with _get_run_slots():
+            try:
+                await _weixin_process(user_id, store_owner, is_group, final_text, context_token)
+            except Exception as e:
+                print(f"[weixin] 消息处理异常: {type(e).__name__}: {e}", flush=True)
+                traceback.print_exc(file=sys.stdout)
+                sys.stdout.flush()
+
+
+async def _weixin_process(user_id: str, store_owner: str, is_group: bool,
+                          text: str, context_token: str):
+    """锁内处理：斜杠命令 → Claude 会话。owner 维度带 wx: 前缀。"""
+    parsed = parse_command(text)
+    if parsed:
+        cmd, args = parsed
+        if cmd not in BOT_COMMANDS:
+            alt = _bot_command_alias(text)
+            if alt:
+                cmd, args = alt
+        # 群内命令门与飞书一致：写命令归群管理员，/stop /help 放行
+        if is_group and cmd in BOT_COMMANDS and cmd not in ("stop", "help", "h"):
+            allowed, reason = admission.group_command_allowed(
+                store_owner, user_id, mode=config.GROUP_ADMIN_ONLY,
+            )
+            if not allowed:
+                print(f"[weixin group-admin] 拒绝 sender={user_id[:8]}... cmd={cmd}", flush=True)
+                await _weixin_send_text(user_id, "仅群管理员可以执行此操作。", context_token)
+                return
+        print(f"[weixin cmd] 执行命令 {cmd}", flush=True)
+        reply = await handle_command(cmd, args, user_id, store_owner, store)
+        if reply is not None:
+            reply_text = reply["text"] if isinstance(reply, dict) else reply
+            await _weixin_send_text(user_id, reply_text, context_token)
+            return
+        # reply None → 不是 bot 命令，转发给 Claude
+
+    session = await store.get_current(store_owner, store_owner)
+    print(f"[weixin Claude] session={session.session_id} model={session.model}", flush=True)
+
+    # 微信无卡片流式通道：以 typing 状态代替"思考中"
+    try:
+        await asyncio.to_thread(_weixin_client.send_typing, user_id, context_token)
+    except Exception:
+        pass  # typing 是体验增强，失败不影响主流程
+
+    active_run = _active_runs.start_run(store_owner, "", "")
+    ask_options: list[tuple[str, str]] = []
+    plan_exited = False
+
+    async def on_text_chunk(chunk: str):
+        pass  # 纯文本通道无流式展示，攒到最终一次发送
+
+    async def on_tool_use(name: str, inp: dict):
+        nonlocal plan_exited
+        if name.lower() == "exitplanmode":
+            plan_exited = True
+            return
+        if name.lower() == "enterplanmode" and session.permission_mode != "plan":
+            await store.set_permission_mode(store_owner, store_owner, "plan")
+            return
+        if name.lower() == "askuserquestion":
+            detected = _options_from_ask_user(inp)
+            if detected:
+                ask_options.clear()
+                ask_options.extend(detected)
+
+    try:
+        full_text, new_session_id, used_fallback = await run_claude(
+            message=text,
+            session_id=session.session_id,
+            model=session.model,
+            cwd=session.cwd,
+            permission_mode=session.permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=lambda proc: _active_runs.attach_process(store_owner, proc),
+        )
+    except Exception as e:
+        if active_run.stop_requested:
+            return
+        print(f"[weixin] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        await _weixin_send_text(user_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}", context_token)
+        return
+    finally:
+        _active_runs.clear_run(store_owner, active_run)
+
+    final = (full_text or "").strip() or "（无输出）"
+    if used_fallback:
+        final = "⚠️ 检测到工作目录已变化，旧会话无法继续。本次已自动切换到新 session。\n\n" + final
+    options = _extract_options(final) or ask_options
+    if options:
+        final += "\n\n请回复编号或选项内容：\n" + "\n".join(
+            f"{idx+1}. {display}" for idx, (display, _value) in enumerate(options)
+        )
+    if plan_exited and session.permission_mode == "plan":
+        await store.set_permission_mode(store_owner, store_owner, "bypassPermissions")
+        final += "\n\n🚀 已退出规划模式，发送任意消息开始执行。"
+
+    for chunk in split_long_reply_text(final, config.WEIXIN_REPLY_MAX_CHARS):
+        await _weixin_send_text(user_id, chunk, context_token)
+
+    if new_session_id:
+        await store.on_claude_response(store_owner, store_owner, new_session_id, text)
+
+
+def _start_weixin_channel():
+    global _weixin_client, _weixin_runtime
+    if not config.WEIXIN_ENABLED:
+        print("   微信渠道    : 未配置 WEIXIN_BOT_TOKEN，已禁用（扫码注册：python weixin_login.py --save）")
+        return
+    _weixin_client = WeixinClient(config.WEIXIN_BOT_TOKEN, config.WEIXIN_ILINK_BASE_URL)
+
+    def _probe():
+        try:
+            print(f"   微信连通    : {_weixin_client.test()}", flush=True)
+        except Exception as e:
+            print(f"[weixin] 连通性检查失败: {e}", flush=True)
+    threading.Thread(target=_probe, daemon=True).start()
+
+    _weixin_runtime = WeixinRuntime(
+        token=config.WEIXIN_BOT_TOKEN,
+        bot_user_id=config.WEIXIN_BOT_USER_ID,
+        buf_path=config.WEIXIN_BUF_PATH,
+        on_message=_weixin_on_message,
+        base_url=config.WEIXIN_ILINK_BASE_URL,
+        status_sink=_weixin_status_sink,
+    )
+    _weixin_runtime.start()
+    print("   微信渠道    : 已启用（iLink 长轮询）")
+
+
 def _options_from_ask_user(inp: dict) -> list[tuple[str, str]]:
     """从 AskUserQuestion 的结构化 tool input 取选项，不靠正则猜自由文本。"""
     groups = inp.get("questions")
@@ -1590,6 +1863,9 @@ def main():
     # 启动后台线程
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_bg_summary_thread, daemon=True).start()
+
+    # 微信 iLink 渠道（无 token 自动禁用）
+    _start_weixin_channel()
 
     print("✅ 连接飞书 WebSocket 长连接（自动重连）...")
     ws_client.start()  # 阻塞，内部运行 asyncio loop

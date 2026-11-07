@@ -44,3 +44,18 @@ GROUP_ADMIN_ONLY = os.getenv("GROUP_ADMIN_ONLY", "auto").strip().lower()
 
 # 流式卡片更新：每积累多少字符推送一次
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "20"))
+
+# ── 微信 iLink Bot 渠道 ──────────────────────────────────────────
+# 无 token 时自动禁用；扫码注册：python weixin_login.py --save
+WEIXIN_BOT_TOKEN = os.getenv("WEIXIN_BOT_TOKEN", "").strip()
+WEIXIN_BOT_USER_ID = os.getenv("WEIXIN_BOT_USER_ID", "").strip()
+WEIXIN_ENABLED = bool(WEIXIN_BOT_TOKEN)
+WEIXIN_ILINK_BASE_URL = os.getenv("WEIXIN_ILINK_BASE_URL", "").strip()
+# getupdates 长轮询服务端挂起时长（秒）；客户端超时要比它大
+WEIXIN_GETUPDATES_TIMEOUT = int(os.getenv("WEIXIN_GETUPDATES_TIMEOUT", "90"))
+# 游标持久化文件；游标在整批消息处理完成后才写入（官方 bugfix 语义）
+WEIXIN_BUF_PATH = os.path.expanduser(
+    os.getenv("WEIXIN_BUF_PATH", os.path.join(SESSIONS_DIR, "weixin_updates_buf.json"))
+)
+# 微信渠道回复长度上限（无卡片，纯文本分片）
+WEIXIN_REPLY_MAX_CHARS = int(os.getenv("WEIXIN_REPLY_MAX_CHARS", "1500"))
