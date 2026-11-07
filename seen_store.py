@@ -87,11 +87,10 @@ class SeenStore:
         return False
 
     def _evict_expired_locked(self, now: float) -> None:
+        # 不假设时间戳单调：磁盘重载/手工编辑可能打乱顺序，break 会漏删后面的过期项
         for mid, ts in list(self._items.items()):
             if now - ts > self.ttl:
                 del self._items[mid]
-            else:
-                break
 
     def _maybe_flush(self, now: float, force: bool = False) -> None:
         if not self._dirty:

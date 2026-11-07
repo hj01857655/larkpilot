@@ -510,3 +510,38 @@ def test_cleanup_stale_downloads(tmp_path, monkeypatch):
     assert removed == 1
     assert not old.exists()
     assert new.exists() and other.exists()
+
+
+# ── 状态表情落盘与重启清理 ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reactions_persist_and_orphan_cleanup(monkeypatch, tmp_path):
+    from feishu_client import FeishuClient
+
+    f1 = FeishuClient(None, app_id="app1")
+    f1._reactions_path = str(tmp_path / "reactions.json")
+    f1._reaction_ids[("app1", "m1")] = "r1"
+    f1._reaction_states[("app1", "m1")] = "working"
+    f1._flush_reactions()
+
+    # 新实例（=重启后的进程）从盘上恢复映射
+    f2 = FeishuClient(None, app_id="app1")
+    f2._reactions_path = f1._reactions_path
+    f2._load_reactions()
+    assert f2._reaction_ids[("app1", "m1")] == "r1"
+    assert f2._reaction_states[("app1", "m1")] == "working"
+
+    deleted = []
+    async def fake_del(mid, rid):
+        deleted.append((mid, rid))
+    monkeypatch.setattr(f2, "_delete_reaction", fake_del)
+
+    cleaned = await f2.cleanup_orphan_reactions()
+    assert cleaned == 1 and deleted == [("m1", "r1")]
+    assert f2._reaction_ids == {} and f2._reaction_states == {}
+    # 清理结果落盘：再起一个实例不会复现孤儿
+    f3 = FeishuClient(None, app_id="app1")
+    f3._reactions_path = f1._reactions_path
+    f3._load_reactions()
+    assert f3._reaction_ids == {}

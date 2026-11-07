@@ -98,7 +98,7 @@ python3 main.py
 
 | 命令 | 说明 |
 |------|------|
-| `/new` | 开始新 session |
+| `/new` | 开始新 session（`/clear` 为其别名） |
 | `/new plan` | 新 session 并进入 Plan 模式 |
 | `/resume` | 列出历史 session（按钮选择） |
 | `/resume 3` | 恢复第 3 个 session |
