@@ -813,6 +813,8 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg,
 
     elif msg.message_type in ("image", "sticker"):
         # sticker（表情包）也是 image_key，同一下载路径
+        if is_group:
+            _accumulate_mentions(chat_id, msg)
         try:
             image_key = json.loads(msg.content).get("image_key", "")
             if not image_key:
@@ -829,6 +831,8 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg,
 
     elif msg.message_type == "file":
         # 文件消息：下载附件后把本地路径喂给 Claude（对齐 ZCode attachment 语义）
+        if is_group:
+            _accumulate_mentions(chat_id, msg)
         try:
             content = json.loads(msg.content)
             file_key = content.get("file_key", "")
@@ -1053,7 +1057,12 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     # 按钮 value 是外部输入，不能绕过 host 的授权门
     if not admission.is_allowed(user_id):
         print(f"[admission] 拒绝按钮回调 sender={str(user_id)[:8]}...", flush=True)
-        return P2CardActionTriggerResponse()
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "error"
+        toast.content = "无权限。"
+        resp.toast = toast
+        return resp
 
     # 飞书回调超时/非 2xx 会重推同一动作、Claude 会把同一个答案再跑一遍。
     # 在授权门之后、任何 dispatch 之前做幂等拦截，静默返回不闪 toast。
@@ -1539,6 +1548,16 @@ def main():
     stale = _cleanup_stale_downloads()
     if stale:
         print(f"   已清理 {stale} 个过期下载附件")
+
+    # 上一轮进程的运行已死，遗留的 working/waiting 表情不会再被翻面，启动即清
+    async def _cleanup_reactions():
+        try:
+            cleaned = await feishu.cleanup_orphan_reactions()
+            if cleaned:
+                print(f"   已清理 {cleaned} 个遗留状态表情")
+        except Exception as e:
+            print(f"[warn] 清理遗留表情失败: {e}", flush=True)
+    asyncio.run_coroutine_threadsafe(_cleanup_reactions(), _bot_loop)
 
     print("🚀 飞书 Claude Bot 启动中...")
     print(f"   App ID      : {config.FEISHU_APP_ID}")

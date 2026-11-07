@@ -99,9 +99,62 @@ class FeishuClient:
         # reaction 不会自动消失，必须记录 reaction_id 才能在状态切换/结束时删除或替换
         self._reaction_ids: dict[tuple[str, str], str] = {}
         self._reaction_states: dict[tuple[str, str], str] = {}
+        # 表情映射落盘：看门狗 4h 重启会清空内存，不落盘的话横跨重启的
+        # 运行会把 working/waiting 表情永久留在消息上（没人再知道 reaction_id）
+        self._reactions_path = os.path.expanduser("~/.feishu-claude/reactions.json")
+        self._load_reactions()
         # 机器人自身身份缓存：成功永久缓存，失败短缓存 60s 防止每条消息重打 API
         self._bot_open_id: str | None = None
         self._bot_open_id_failed_at: float = 0.0
+
+    def _load_reactions(self) -> None:
+        import json
+        try:
+            with open(self._reactions_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, rid in (data.get("reactions") or {}).items():
+                app_id, _, mid = str(k).partition(":")
+                if rid and mid:
+                    self._reaction_ids[(app_id, mid)] = rid
+            for k, state in (data.get("states") or {}).items():
+                app_id, _, mid = str(k).partition(":")
+                if state and mid:
+                    self._reaction_states[(app_id, mid)] = state
+        except (OSError, ValueError):
+            pass
+
+    def _flush_reactions(self) -> None:
+        import json
+        import tempfile
+        data = {
+            "reactions": {f"{a}:{m}": rid for (a, m), rid in self._reaction_ids.items()},
+            "states": {f"{a}:{m}": st for (a, m), st in self._reaction_states.items()},
+        }
+        parent = os.path.dirname(self._reactions_path)
+        try:
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._reactions_path)
+        except OSError:
+            # 表情清理失败只影响重启后的孤儿清理，不影响消息主流程
+            pass
+
+    async def cleanup_orphan_reactions(self) -> int:
+        """启动时清理上一轮进程遗留的状态表情（该轮运行已死，表情不会再被翻面）。"""
+        cleaned = 0
+        for (app_id, mid), rid in list(self._reaction_ids.items()):
+            try:
+                await self._delete_reaction(mid, rid)
+                cleaned += 1
+            except Exception as e:
+                print(f"[reaction] 清理孤儿表情失败 mid={mid[:12]}...: {e}", flush=True)
+        if cleaned or self._reaction_ids:
+            self._reaction_ids.clear()
+            self._reaction_states.clear()
+            self._flush_reactions()
+        return cleaned
 
     def _tenant_token_sync(self, ctx) -> str:
         """同步获取 tenant_access_token（线程池中调用）。"""
@@ -587,6 +640,7 @@ class FeishuClient:
             self._reaction_ids.pop(key, None)
 
         # 再加新表情
+        changed = False
         if emoji:
             new_id = await self._add_reaction(message_id, emoji)
             if new_id:
@@ -594,6 +648,10 @@ class FeishuClient:
                 self._reaction_states[key] = state
             else:
                 self._reaction_states.pop(key, None)
+            changed = True
         else:
             # 清除状态
             self._reaction_states.pop(key, None)
+            changed = bool(reaction_id)
+        if changed:
+            self._flush_reactions()
