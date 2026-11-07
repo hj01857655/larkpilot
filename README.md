@@ -36,12 +36,16 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
 **群聊支持**
 
 - @机器人 即可对话，不 @ 的消息静默忽略
-- 每个群独立 session、模型、工作目录
-- `/ws` 为不同群绑定不同项目，多群并发互不阻塞
+- 群内所有人共享一个会话与 claude 进程（归属键是群，不是人），不会 N 个人拉起 N 个进程
+- 每个群独立 session、模型、工作目录；工作空间库存（`/ws save`）跨群共享，绑定（`/ws use`）归各自群
+- 群内写命令（`/new` `/resume` `/model` `/mode` `/ws` `/cd`）默认只归群管理员执行——首个使用命令的成员被锁定为该群管理员（落盘，重启不丢）；`/stop` 与 `/help` 始终放行；`GROUP_ADMIN_ONLY=off` 可关闭；按钮菜单、模式切换、恢复会话按钮同样受此门约束
+- 支持 @ 提及解析：@ 成员的名字会转成对应 open_id 传给 Claude（自动拉取群成员目录 + 消息 mention 索引）
 
-**图片识别**
+**图片与文件**
 
 - 直接发截图，Claude 自动下载并分析
+- 发文件（PDF、代码、zip 等）自动下载并作为附件交给 Claude（单文件上限 5MB）
+- 富文本消息（post）、表情包（sticker）自动转文本处理；语音/媒体消息会收到明确提示
 
 **健壮运行**
 
@@ -88,7 +92,7 @@ python3 main.py
 
 ## 命令速查
 
-输入 `/` 可弹出按钮菜单，也可以直接输入命令。
+输入 `/` 可弹出按钮菜单，也可以直接输入命令。常用命令支持中文别名：`/帮助` `/状态` `/新建` `/停止` `/模型` `/模式` `/项目`。
 
 ### 会话管理
 
@@ -181,7 +185,8 @@ python3 main.py
 |-----------|------|
 | `im:message` | 获取与发送单聊、群组消息 |
 | `im:message:send_as_bot` | 以应用的身份发送消息 |
-| `im:resource` | 获取消息中的资源文件（图片等） |
+| `im:resource` | 获取消息中的资源文件（图片、文件下载等） |
+| `im:chat.member:read` | 读取群成员列表（可选，用于 @ 提及的姓名解析；拿不到时自动降级，不影响核心功能） |
 
 ### 4. 启用长连接模式
 
@@ -222,6 +227,21 @@ python3 main.py
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
 | `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
+| `ADMISSION_MODE` | 否 | `off` | 授权门：`off` 全放行；`observe` 只记录不放行；`auto` 仅管理员可执行。`auto` 未设 `ADMIN_OPEN_ID` 时锁定首个私聊者 |
+| `ADMIN_OPEN_ID` | 否 | 空 | 显式管理员 open_id；`auto` 模式的状态落在 `~/.feishu-claude/admission.json`，重启不丢 |
+| `MAX_CONCURRENT_RUNS` | 否 | `2` | 全局 claude CLI 并发上限，保护本机与上游网关 |
+| `INTERRUPT_ON_NEW_MESSAGE` | 否 | `false` | `false` = 后续消息排队，当前 turn 结束后作 follow-up 继续；`true` = 恢复旧的"新消息腰斩任务"行为 |
+| `QUIET_MODE` | 否 | `false` | `true` = 干活时静默，只在结果/失败/需要人回答时更新卡片，并去掉末尾 `✅` |
+| `REPLY_MAX_CHARS` | 否 | `1500` | 飞书单条消息长度上限，超出保留尾部结果，不拆成多条刷屏 |
+| `CALLBACK_HOST` | 否 | `127.0.0.1` | 回调服务绑定地址；默认只监听本机 |
+| `CONTROL_TOKEN` | 否 | 空 | 设置后 `/handover` 才启用；`handover.py` 侧需设置同名环境变量 |
+| `SEEN_TTL` | 否 | `600` | 幂等表保留时长（秒）；状态在 `~/.feishu-claude/seen_messages.json`，看门狗重启后飞书重推事件不会跑两遍 |
+| `SEEN_MAX` | 否 | `2000` | 幂等表条目上限，超出按 LRU 淘汰 |
+| `SEEN_STORE_PATH` | 否 | `~/.feishu-claude/seen_messages.json` | 幂等表落盘路径 |
+| `GROUP_ADMIN_ONLY` | 否 | `auto` | 群内写命令权限门：`auto` = 首个执行命令的群成员锁定为该群管理员；`off` = 全放行。状态落在 `~/.feishu-claude/admission.json` 的 `group_admins` 字段 |
+
+> 授权判断在 `admission.py` 里由代码强制，消息文本、引用文档和按钮 `value` 都改不了权限。
+> 卡片按钮回调与 `/handover` HTTP 接口各自也要过授权门或共享密钥。
 
 ## 部署
 
