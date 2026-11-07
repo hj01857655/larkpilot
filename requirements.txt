@@ -1,2 +1,3 @@
 lark-oapi>=1.3.0
 python-dotenv>=1.0.0
+psutil>=5.9.0

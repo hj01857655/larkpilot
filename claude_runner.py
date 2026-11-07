@@ -17,6 +17,15 @@ _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
 
 def _has_children(pid: int) -> bool:
     """进程是否有活跃子进程（说明在跑 bash 命令、编译等）。"""
+    if os.name == "nt":
+        # Windows 没有 pgrep；用 psutil 查直接子进程，避免静默返回 False 后误杀长任务
+        try:
+            import psutil
+
+            return any(c.is_running() and c.status() != psutil.STATUS_ZOMBIE
+                       for c in psutil.Process(pid).children(recursive=False))
+        except Exception:
+            return False
     try:
         result = sp.run(["pgrep", "-P", str(pid)], capture_output=True, timeout=5)
         return result.returncode == 0
@@ -76,6 +85,11 @@ async def run_claude(
             cmd += ["--resume", active_session_id]
         if model:
             cmd += ["--model", model]
+
+        # Windows 上 npm 安装的 claude 是 .cmd 批处理，Python 3.12+ 禁止 exec 直接运行
+        # （BatBadBut 加固），需包一层 cmd /c；参数均为无空格的 CLI 旗标，无注入面
+        if os.name == "nt" and CLAUDE_CLI.lower().endswith((".cmd", ".bat")):
+            cmd = ["cmd", "/c"] + cmd
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)

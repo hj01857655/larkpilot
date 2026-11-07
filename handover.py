@@ -56,10 +56,15 @@ def main():
         sys.exit(1)
 
     session_id, cwd = found
+    token = os.environ.get("CONTROL_TOKEN", "").strip()
+    if not token:
+        print("ERROR: 未设置 CONTROL_TOKEN（bot 侧同样需要配置）", file=sys.stderr)
+        sys.exit(1)
     params = urllib.parse.urlencode({
         "session_id": session_id,
         "cwd": cwd,
         "model": os.environ.get("CLAUDE_MODEL", "claude-opus-4-6"),
+        "token": token,
     })
 
     try:
