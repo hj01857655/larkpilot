@@ -37,8 +37,8 @@ async def test_workspace_binding_isolated_per_group(isolated_store, tmp_path):
     bind1 = await handle_command("workspace", "use proj1", user_id, group_a, isolated_store)
     bind2 = await handle_command("workspace", "use proj2", user_id, group_b, isolated_store)
 
-    session_a = await isolated_store.get_current(user_id, group_a)
-    session_b = await isolated_store.get_current(user_id, group_b)
+    session_a = await isolated_store.get_current(group_a, group_a)
+    session_b = await isolated_store.get_current(group_b, group_b)
 
     assert "已保存工作空间" in reply1
     assert "已保存工作空间" in reply2
@@ -57,7 +57,7 @@ async def test_workspace_save_uses_current_cwd_by_default(isolated_store, tmp_pa
     project = tmp_path / "project"
     project.mkdir()
 
-    await isolated_store.set_cwd(user_id, chat_id, str(project))
+    await isolated_store.set_cwd(chat_id, chat_id, str(project))
     reply = await handle_command("workspace", "save backend", user_id, chat_id, isolated_store)
 
     assert "已保存工作空间 `backend`" in reply
@@ -77,7 +77,7 @@ async def test_cd_clears_named_workspace_binding(isolated_store, tmp_path):
     await handle_command("workspace", "use backend", user_id, chat_id, isolated_store)
 
     reply = await handle_command("cd", str(other), user_id, chat_id, isolated_store)
-    current = await isolated_store.get_current(user_id, chat_id)
+    current = await isolated_store.get_current(chat_id, chat_id)
 
     assert "解除原工作空间绑定" in reply
     assert current.workspace == ""
@@ -93,7 +93,7 @@ async def test_ls_lists_current_workspace_contents(isolated_store, tmp_path):
     (project / "src").mkdir()
     (project / "README.md").write_text("hi", encoding="utf-8")
 
-    await isolated_store.set_cwd(user_id, chat_id, str(project))
+    await isolated_store.set_cwd(chat_id, chat_id, str(project))
     reply = await handle_command("ls", "", user_id, chat_id, isolated_store)
 
     assert "目录内容" in reply
@@ -112,9 +112,28 @@ async def test_ls_supports_relative_subdir(isolated_store, tmp_path):
     nested.mkdir()
     (nested / "app.py").write_text("print('ok')", encoding="utf-8")
 
-    await isolated_store.set_cwd(user_id, chat_id, str(project))
+    await isolated_store.set_cwd(chat_id, chat_id, str(project))
     reply = await handle_command("ls", "backend", user_id, chat_id, isolated_store)
 
     assert "请求路径：`backend`" in reply
     assert f"绝对路径：`{nested}`" in reply
     assert "`app.py`" in reply
+
+
+@pytest.mark.asyncio
+async def test_workspace_library_shared_across_groups(isolated_store, tmp_path):
+    """库存归人：A 群保存的项目，B 群也能 use；绑定归会话，互不影响"""
+    user_id = "user_123"
+    project = tmp_path / "project"
+    project.mkdir()
+
+    save = await handle_command("workspace", f'save proj "{project}"', user_id, "group_a", isolated_store)
+    bind_b = await handle_command("workspace", "use proj", user_id, "group_b", isolated_store)
+
+    assert "已保存工作空间" in save
+    assert "当前群组已绑定工作空间 `proj`" in bind_b
+    session_b = await isolated_store.get_current("group_b", "group_b")
+    assert session_b.cwd == str(project)
+    # A 群的绑定不受 B 群影响
+    session_a = await isolated_store.get_current("group_a", "group_a")
+    assert session_a.workspace == ""

@@ -15,6 +15,8 @@ os.environ.setdefault("FEISHU_APP_SECRET", "test_app_secret")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from feishu_client import FeishuClient  # noqa: E402
+
 
 # ── helpers ──────────────────────────────────────────────────
 
@@ -158,7 +160,7 @@ async def test_private_chat_full_flow():
 
     card_updates = []
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", return_value=proc):
 
@@ -206,7 +208,7 @@ async def test_private_chat_streaming_updates_card():
 
     card_updates = []
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", return_value=proc):
 
@@ -240,7 +242,7 @@ async def test_tool_use_updates_card_with_progress():
 
     card_updates = []
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", return_value=proc):
 
@@ -281,7 +283,7 @@ async def test_group_chat_ignores_without_mention():
         mentions=None,  # 没有 @mention
     )
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store:
         mock_feishu.send_card_to_user = AsyncMock()
         mock_feishu.reply_card = AsyncMock()
@@ -307,7 +309,7 @@ async def test_group_chat_ignores_empty_mention_list():
         mentions=[],
     )
 
-    with patch("main.feishu") as mock_feishu:
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu:
         await handle_message_async(event)
 
     mock_feishu.reply_card.assert_not_called()
@@ -336,7 +338,7 @@ async def test_group_chat_responds_with_mention():
     claude_lines = _make_claude_output("你好！有什么可以帮你的？")
     proc = FakeProc(claude_lines)
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", return_value=proc):
 
@@ -395,7 +397,7 @@ async def test_group_chat_strips_mention_placeholder():
 
     proc = CapturingProc(claude_lines)
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", return_value=proc):
 
@@ -440,7 +442,7 @@ async def test_group_chat_slash_command_with_mention():
         mentions=[mention],
     )
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store:
 
         mock_feishu.reply_card = AsyncMock(return_value="reply_card_003")
@@ -457,8 +459,8 @@ async def test_group_chat_slash_command_with_mention():
 # ── 测试：session 隔离（端到端）──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_group_sessions_isolated_end_to_end():
-    """不同群聊发消息，各自的 session 独立"""
+async def test_group_sessions_isolated_per_chat():
+    """群会话归属 chat 维度：不同群各自独立，群内成员共享"""
     from main import handle_message_async, _chat_locks
     from session_store import SessionStore
 
@@ -481,7 +483,7 @@ async def test_group_sessions_isolated_end_to_end():
 
     real_store = SessionStore()
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store", real_store):
 
         mock_feishu.reply_card = AsyncMock(return_value="card_id")
@@ -489,11 +491,48 @@ async def test_group_sessions_isolated_end_to_end():
         await handle_message_async(event_a)
         await handle_message_async(event_b)
 
-    session_a = await real_store.get_current("user_001", "group_a")
-    session_b = await real_store.get_current("user_001", "group_b")
+    session_a = await real_store.get_current("group_a", "group_a")
+    session_b = await real_store.get_current("group_b", "group_b")
 
     assert session_a.model == "claude-opus-4-6"
     assert session_b.model == "claude-haiku-4-5-20251001"
+
+
+@pytest.mark.asyncio
+async def test_group_users_share_one_session():
+    """同一群的两个成员共用一个会话（ZCode 语义：群身份不能用发送者代替）"""
+    from main import handle_message_async, _chat_locks
+    from session_store import SessionStore
+
+    _chat_locks.clear()
+
+    mention = MagicMock()
+    mention.key = "@_user_1"
+
+    event_a = _make_event(
+        user_id="user_001", chat_id="group_x", chat_type="group",
+        text="@_user_1 /model opus", message_id="msg_x1",
+        mentions=[mention],
+    )
+    event_b = _make_event(
+        user_id="user_002", chat_id="group_x", chat_type="group",
+        text="@_user_1 /model haiku", message_id="msg_x2",
+        mentions=[mention],
+    )
+
+    real_store = SessionStore()
+
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
+         patch("main.store", real_store):
+
+        mock_feishu.reply_card = AsyncMock(return_value="card_id")
+
+        await handle_message_async(event_a)
+        await handle_message_async(event_b)
+
+    # 两次设置落在同一个归属键上，最终值是最后一次
+    shared = await real_store.get_current("group_x", "group_x")
+    assert shared.model == "claude-haiku-4-5-20251001"
 
 
 # ── 测试：_chat_locks 清理 ──────────────────────────────────
@@ -519,7 +558,7 @@ async def test_chat_locks_cleanup():
         text="/help",
     )
 
-    with patch("main.feishu") as mock_feishu:
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu:
         mock_feishu.send_card_to_user = AsyncMock(return_value="card_id")
         await handle_message_async(event)
 
@@ -547,7 +586,7 @@ async def test_fresh_session_fallback_shows_warning():
 
     card_updates = []
 
-    with patch("main.feishu") as mock_feishu, \
+    with patch("main.feishu", new_callable=AsyncMock) as mock_feishu, \
          patch("main.store") as mock_store, \
          patch("asyncio.create_subprocess_exec", side_effect=lambda *a, **kw: next(procs)):
 

@@ -607,12 +607,19 @@ class SessionStore:
         if name not in workspaces:
             return False
 
+        removed_path = workspaces[name]
         del workspaces[name]
-        for chat_data in user.values():
-            if not isinstance(chat_data, dict) or "current" not in chat_data:
+        # 绑定挂在会话归属键（私聊=user_id，群聊=chat_id）下，全树扫描清理；
+        # 只清路径一致的绑定：同名库存可能归属别人，误清会牵连无关会话
+        for owner_data in self._data.values():
+            if not isinstance(owner_data, dict):
                 continue
-            if chat_data["current"].get("workspace") == name:
-                chat_data["current"]["workspace"] = ""
+            for chat_data in owner_data.values():
+                if not isinstance(chat_data, dict) or "current" not in chat_data:
+                    continue
+                cur = chat_data["current"]
+                if cur.get("workspace") == name and cur.get("cwd") == removed_path:
+                    cur["workspace"] = ""
         await self._save_async()
         return True
 
@@ -621,7 +628,7 @@ class SessionStore:
         path = self._user(user_id).get("workspaces", {}).get(name)
         if not path:
             return None
-        await self.set_cwd(user_id, chat_id, path, workspace_name=name)
+        await self.set_cwd(chat_id, chat_id, path, workspace_name=name)
         return path
 
     async def handover_session(
