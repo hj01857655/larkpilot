@@ -1,5 +1,5 @@
 [project]
-name = "feishu-claude-code"
+name = "larkpilot"
 version = "0.1.0"
 description = "Bridge Claude Code CLI with Feishu/Lark via WebSocket"
 requires-python = ">=3.11"

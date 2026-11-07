@@ -1,4 +1,4 @@
-# feishu-claude-code
+# larkpilot
 
 在飞书里直接和你本机的 Claude Code 对话。
 
@@ -67,8 +67,8 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
 ### 安装
 
 ```bash
-git clone https://github.com/joewongjc/feishu-claude-code.git
-cd feishu-claude-code
+git clone https://github.com/hj01857655/larkpilot.git
+cd larkpilot
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -283,7 +283,7 @@ python3 handover.py "对话中的一段独特文本"
 
 ## English
 
-**feishu-claude-code** bridges your local Claude Code CLI with Feishu/Lark messenger via WebSocket.
+**larkpilot** bridges your local Claude Code CLI with Feishu/Lark messenger via WebSocket.
 
 - **No public IP needed** - Feishu WebSocket long connection, runs on your local machine
 - **Streaming card output** - Real-time typing effect with tool call progress visualization
